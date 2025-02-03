@@ -7,8 +7,7 @@ import { useState } from "react";
 import QRCode from "react-qr-code";
 
 export default function Home() {
-  const api_key = process.env.NEXT_PUBLIC_HELIUS_API_KEY!
-  const RPC = `https://mainnet.helius-rpc.com/?api-key=${api_key}`
+  const RPC = process.env.NEXT_PUBLIC_SOLANA_RPC_ENDPOINT!
   const connection = new Connection(RPC, 'confirmed');
 
   // URL Variables
