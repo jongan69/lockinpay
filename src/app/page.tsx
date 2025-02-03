@@ -1,20 +1,43 @@
 "use client"
 
-import { Cluster, clusterApiUrl, Connection, PublicKey, Keypair } from "@solana/web3.js";
-import { encodeURL, createQR, findReference, FindReferenceError, validateTransfer } from "@solana/pay";
+import { Connection, PublicKey, Keypair } from "@solana/web3.js";
+import { encodeURL, findReference, FindReferenceError, validateTransfer } from "@solana/pay";
 import BigNumber from "bignumber.js";
-import { useState } from "react";
-import QRCode from "react-qr-code";
+import { useState, useEffect } from "react";
+import dynamic from 'next/dynamic';
+
+// Import QR code with no SSR
+const QRCode = dynamic(() => import('react-qr-code'), { 
+  ssr: false,
+  loading: () => <div className="w-[256px] h-[256px] bg-gray-200 animate-pulse rounded-xl"></div>
+});
+
+const MAX_RETRIES = 5;
+const INITIAL_BACKOFF_MS = 250;
+const MAX_BACKOFF_MS = 2000;
+
+// Add this type near the top of the file, after imports
+type SignatureInfo = {
+  signature: string;
+};
+
+const getConnection = () => {
+  const RPC = process.env.NEXT_PUBLIC_SOLANA_RPC_ENDPOINT!;
+  return new Connection(RPC, {
+    commitment: 'confirmed',
+    confirmTransactionInitialTimeout: 60000, // 60 seconds
+    disableRetryOnRateLimit: false,
+  });
+}
+
+const connection = getConnection();
 
 export default function Home() {
-  const RPC = process.env.NEXT_PUBLIC_SOLANA_RPC_ENDPOINT!
-  const connection = new Connection(RPC, 'confirmed');
-
   // URL Variables
   const [address, setAddress] = useState("");
   const [amount, setAmount] = useState(new BigNumber(1));
   const [message, setMessage] = useState("$LOCKIN Payment Request");
-  const reference = new Keypair().publicKey;
+  const [reference, setReference] = useState<PublicKey | null>(null);
   const label = "$LOCKIN Payment";
   const memo = "$LOCKIN Transfer";
   
@@ -32,68 +55,130 @@ export default function Home() {
     }
 
     try {
-      console.log("Creating a payment URL \n");
+      setPaymentStatus('generating'); // Add a new status for QR generation
+      console.log("Creating a payment URL");
+      
+      const newReference = new Keypair().publicKey;
+      setReference(newReference);
       const recipientAddress = new PublicKey(address);
+      
       const url = encodeURL({
         recipient: recipientAddress,
         amount,
         splToken,
-        reference,
+        reference: newReference,
         label,
         message,
         memo,
       });
 
-      setQrCodeValue(url.toString());
-      checkPayment(recipientAddress);
+      const urlString = url.toString();
+      console.log("Payment URL generated:", urlString);
+      setQrCodeValue(urlString);
+
+      // Start monitoring for payment
+      checkPayment(recipientAddress, newReference).catch((error) => {
+        console.error('Payment monitoring failed:', error);
+        setPaymentStatus('failed');
+        alert('Payment monitoring failed. Please try again.');
+      });
+
     } catch (error) {
-      alert("Invalid recipient address");
-      console.error(error);
+      console.error('Error creating payment:', error);
+      setPaymentStatus('failed');
+      alert("Failed to create payment request. Please check the recipient address and try again.");
     }
   }
 
-  async function checkPayment(recipientAddress: PublicKey) {
+  async function checkPayment(recipientAddress: PublicKey, paymentReference: PublicKey) {
     setPaymentStatus('pending');
-    console.log('Searching for the payment\n');
-    let signatureInfo;
-    const { signature }: { signature: any } = await new Promise((resolve, reject) => {
-      const interval = setInterval(async () => {
-        console.count('Checking for transaction...' + reference);
-        try {
-          signatureInfo = await findReference(connection, reference, { finality: 'confirmed' });
-          console.log('\n Signature: ', signatureInfo.signature, signatureInfo);
-          clearInterval(interval);
-          resolve(signatureInfo);
-        } catch (error: any) {
-          if (!(error instanceof FindReferenceError)) {
-            console.error(error);
-            clearInterval(interval);
-            reject(error);
-          }
-        }
-      }, 250);
-    });
-
-    setPaymentStatus('confirmed');
-    console.log('Validating the payment\n');
+    console.log('Starting payment check...');
+    
     try {
-      await validateTransfer(
-        connection, 
-        signature, 
-        { 
-          recipient: recipientAddress, 
-          amount,
-          splToken,
-        }
-      );
-      setPaymentStatus('validated');
-      console.log('Payment validated');
-      return true;
+      // Wait for the transaction using findReference
+      const signatureInfo = await new Promise<SignatureInfo>((resolve, reject) => {
+        let retryCount = 0;
+        const checkTransaction = async () => {
+          console.log(`Checking for transaction... (Attempt ${retryCount + 1})`);
+          
+          try {
+            const signature = await findReference(connection, paymentReference, {
+              finality: 'confirmed',
+            });
+            console.log('Transaction found! Signature:', signature.signature);
+            resolve(signature);
+          } catch (error) {
+            if (error instanceof FindReferenceError) {
+              // Transaction not found yet, continue checking
+              retryCount++;
+              if (retryCount < MAX_RETRIES) {
+                const delay = Math.min(INITIAL_BACKOFF_MS * Math.pow(1.5, retryCount), MAX_BACKOFF_MS);
+                console.log(`Transaction not found yet. Retrying in ${delay}ms...`);
+                setTimeout(checkTransaction, delay);
+              } else {
+                reject(new Error('Payment timeout: Transaction not found'));
+              }
+            } else {
+              // Unexpected error
+              console.error('Unexpected error while checking for transaction:', error);
+              reject(error);
+            }
+          }
+        };
+
+        // Start checking
+        checkTransaction();
+      });
+
+      // Transaction found - update status and validate
+      setPaymentStatus('confirmed');
+      console.log('Transaction confirmed, validating payment...');
+
+      // Validate the transaction
+      try {
+        await validateTransfer(
+          connection,
+          signatureInfo.signature,
+          {
+            recipient: recipientAddress,
+            amount,
+            splToken,
+            reference: paymentReference,
+          },
+        );
+
+        console.log('Payment validated successfully!');
+        setPaymentStatus('validated');
+        return true;
+      } catch (error) {
+        console.error('Payment validation failed:', error);
+        setPaymentStatus('failed');
+        throw new Error('Payment validation failed');
+      }
+
     } catch (error) {
-      console.error('Payment failed', error);
-      return false;
+      console.error('Payment processing error:', error);
+      setPaymentStatus('failed');
+      throw error;
     }
   }
+
+  const getStatusMessage = (status: string) => {
+    switch (status) {
+      case 'generating':
+        return 'Generating payment request...';
+      case 'pending':
+        return 'Waiting for payment...';
+      case 'confirmed':
+        return 'Payment confirmed, validating...';
+      case 'validated':
+        return 'Payment successfully validated!';
+      case 'failed':
+        return 'Payment failed. Please try again.';
+      default:
+        return '';
+    }
+  };
 
   return (
     <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-b from-[#5977c5] to-[#2a3b66]">
@@ -161,9 +246,11 @@ export default function Home() {
           <div className={`mt-4 p-3 text-center rounded-lg border ${
             paymentStatus === 'pending' ? 'bg-yellow-900/30 text-yellow-100 border-yellow-500/30' :
             paymentStatus === 'confirmed' ? 'bg-[#5977c5]/30 text-blue-100 border-[#5977c5]/30' :
-            paymentStatus === 'validated' ? 'bg-green-900/30 text-green-100 border-green-500/30' : ''
+            paymentStatus === 'validated' ? 'bg-green-900/30 text-green-100 border-green-500/30' :
+            paymentStatus === 'failed' ? 'bg-red-900/30 text-red-100 border-red-500/30' :
+            'bg-gray-900/30 text-gray-100 border-gray-500/30'
           }`}>
-            Status: {paymentStatus.charAt(0).toUpperCase() + paymentStatus.slice(1)}
+            {getStatusMessage(paymentStatus)}
           </div>
         )}
 
@@ -181,8 +268,11 @@ export default function Home() {
                     <QRCode
                       size={256}
                       style={{ height: "auto", maxWidth: "100%", width: "100%" }}
-                      value={qrCodeValue}
+                      value={qrCodeValue || ""}
                       viewBox={`0 0 256 256`}
+                      level="L"
+                      fgColor="#000000"
+                      bgColor="#FFFFFF"
                     />
                   </div>
                 </>
